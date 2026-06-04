@@ -44,6 +44,7 @@ from paddlefleet.recompute_utils import (
 from paddlefleet.transformer.identity_op import IdentityFuncOp, IdentityOp
 from paddlefleet.transformer.mlp import MLP
 from paddlefleet.transformer.moe.moe_layer import MoELayer
+from paddlefleet.transformer.paddle_norm import RMSNorm
 from paddlefleet.transformer.utils import profile
 from paddlefleet.utils import log_single_rank
 
@@ -58,6 +59,83 @@ if TYPE_CHECKING:
     from paddlefleet.transformer.transformer_config import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+import paddle.nn.functional as F
+
+
+class PerLayerGate(nn.Layer):
+    """Per-layer embedding gate for conditioning transformer layers.
+
+    Matches Gemma 4 PLE DecoderLayer architecture:
+    - gate = act_fn(per_layer_input_gate(hidden))  # [B, S, per_layer_dim]
+    - inject = gate * per_layer_input              # element-wise
+    - output = per_layer_projection(inject)        # project back to hidden_dim
+    - output = post_per_layer_input_norm(output)   # RMSNorm on hidden_dim
+    - return hidden + output                       # residual
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        per_layer_dim: int,
+        init_zero: bool = False,
+        config: "TransformerConfig" = None,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.per_layer_dim = per_layer_dim
+
+        # Gate projection: hidden -> per_layer_dim
+        self.gate_proj = nn.Linear(hidden_size, per_layer_dim, bias_attr=False)
+
+        # Output projection: per_layer_dim -> hidden
+        self.out_proj = nn.Linear(per_layer_dim, hidden_size, bias_attr=False)
+
+        # Activation function
+        act_fn = getattr(config, 'hidden_act', F.silu) if config else F.silu
+        if callable(act_fn):
+            self.act_fn = act_fn
+        else:
+            self.act_fn = F.silu
+
+        # Post-projection RMSNorm on hidden_size
+        self.post_norm = RMSNorm(config=config, normalized_shape=hidden_size)
+
+        # Zero initialization for stable resume from non-PLE checkpoint
+        if init_zero:
+            nn.initializer.Constant(0.0)(self.gate_proj.weight)
+            nn.initializer.Constant(0.0)(self.out_proj.weight)
+
+    def forward(
+        self,
+        hidden_states: paddle.Tensor,
+        per_layer_input: paddle.Tensor,
+    ) -> paddle.Tensor:
+        """Apply per-layer gating.
+
+        Args:
+            hidden_states: [B, S, H] or [S, B, H]
+            per_layer_input: [B, S, D] or [S, B, D]
+
+        Returns:
+            output: Same shape as hidden_states
+        """
+        residual = hidden_states
+
+        # Compute gate: [B, S, D]
+        gate = self.act_fn(self.gate_proj(hidden_states))
+
+        # Element-wise multiplication with per-layer input
+        inject = gate * per_layer_input
+
+        # Project back to hidden dim: [B, S, H]
+        output = self.out_proj(inject)
+
+        # RMSNorm
+        output = self.post_norm(output)
+
+        # Residual connection
+        return residual + output
 
 
 def tensors_clone(outputs):
@@ -415,6 +493,29 @@ class TransformerLayer(nn.Layer):
                 in_mlp_recompute=self.recompute_mlp,
             )
 
+        # ============ Per-Layer Embeddings (PLE) ============
+        self.use_per_layer_embeddings = getattr(self.config, 'use_per_layer_embeddings', False)
+        self._ple_active = False
+        if self.use_per_layer_embeddings:
+            resolved_indices = getattr(self.config, '_ple_resolved_layer_indices', set())
+            if self.layer_number in resolved_indices:
+                per_layer_dim = getattr(self.config, 'per_layer_dim', 256)
+                init_zero = getattr(self.config, 'per_layer_gate_init_zero', False)
+                self.per_layer_gate = PerLayerGate(
+                    hidden_size=self.config.hidden_size,
+                    per_layer_dim=per_layer_dim,
+                    init_zero=init_zero,
+                    config=self.config,
+                )
+                self._per_layer_dim = per_layer_dim
+                sorted_indices = getattr(self.config, '_ple_sorted_layer_indices', [])
+                self._ple_slot_index = sorted_indices.index(self.layer_number)
+                self._ple_active = True
+                logger.info(
+                    f"[PLE] Layer {self.layer_number}: PerLayerGate enabled, "
+                    f"per_layer_dim={per_layer_dim}, init_zero={init_zero}, slot={self._ple_slot_index}"
+                )
+
     def build_schedule_node(self):
         return TransformerLayerNode(
             self,
@@ -570,6 +671,23 @@ class TransformerLayer(nn.Layer):
         if self.config.block_attention_residuals and "blocks" not in dict_args:
             dict_args["blocks"] = []
 
+        # ============ Per-Layer Embeddings (PLE): extract per-layer input for this layer ============
+        per_layer_input = None
+        if self.use_per_layer_embeddings and self._ple_active:
+            ple_inputs = dict_args.get("per_layer_inputs", None)
+            if ple_inputs is not None:
+                # ple_inputs shape: [B, S, num_selected, D] or [S, B, num_selected, D]
+                # Extract slice for this layer's slot: [B, S, D] or [S, B, D]
+                per_layer_input = ple_inputs[:, :, self._ple_slot_index, :]
+                # When MTP is active, hidden_states has been trimmed to main_seq_len,
+                # but per_layer_inputs still has the full seq length. Trim to match.
+                if mtp_input is not None:
+                    main_seq_len = dict_args["hidden_states"].shape[0 if self.config.sequence_parallel else 1]
+                    if self.config.sequence_parallel:
+                        per_layer_input = per_layer_input[:main_seq_len]
+                    else:
+                        per_layer_input = per_layer_input[:, :main_seq_len]
+
         if self.full_recompute:
             hidden_states = dict_args["hidden_states"]
             attention_mask = dict_args.get("attention_mask", None)
@@ -609,9 +727,12 @@ class TransformerLayer(nn.Layer):
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 input_ids=input_ids,
+                per_layer_input=per_layer_input.clone()
+                if per_layer_input is not None
+                else None,
             )
         else:
-            outputs = self._forward_impl(**dict_args)
+            outputs = self._forward_impl(per_layer_input=per_layer_input, **dict_args)
 
         if isinstance(outputs, tuple):
             output, context = outputs[0], outputs[1]
@@ -691,6 +812,7 @@ class TransformerLayer(nn.Layer):
         attention_bias: Tensor | None = None,
         packed_seq_params: PackedSeqParams | None = None,
         input_ids: Tensor | None = None,
+        per_layer_input: Tensor | None = None,
         **kwargs,
     ):
         def need_do_attention():
@@ -800,6 +922,11 @@ class TransformerLayer(nn.Layer):
             with profile(timer_name):
                 output = self._forward_mlp(hidden_states, input_ids=input_ids)
             self._log_md5(output, "layer_output", self.layer_number)
+
+        # ============ Apply PLE gating inside recompute boundary ============
+        if self.use_per_layer_embeddings and self._ple_active and per_layer_input is not None:
+            output = self.per_layer_gate(output, per_layer_input)
+
         if context is not None:
             return output, context
         return output
