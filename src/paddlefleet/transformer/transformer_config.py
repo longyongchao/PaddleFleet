@@ -115,6 +115,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to apply 1/sqrt(hidden_size) scaling to the PLE projection output.
     When False, no scaling is applied to the projection."""
 
+    ple_injection_point: str = "post_attn"
+    """Where to inject PLE gate in the transformer layer.
+    - "post_mlp": After MLP/MoE output (Gemma 4 original style)
+    - "post_attn": After attention output, before MLP/MoE (Gated Attention style)"""
+
     per_layer_selected_layers: list | None = None
     """Which decoder layers receive PLE conditioning.
     Convention: 1-indexed positive, Python-style negative, [0] or None = all layers.

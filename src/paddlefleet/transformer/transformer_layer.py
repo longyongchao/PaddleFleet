@@ -511,9 +511,12 @@ class TransformerLayer(nn.Layer):
                 sorted_indices = getattr(self.config, '_ple_sorted_layer_indices', [])
                 self._ple_slot_index = sorted_indices.index(self.layer_number)
                 self._ple_active = True
+                injection = getattr(self.config, 'ple_injection_point', 'post_mlp')
+                self._ple_inject_post_attn = (injection == 'post_attn')
                 logger.info(
                     f"[PLE] Layer {self.layer_number}: PerLayerGate enabled, "
-                    f"per_layer_dim={per_layer_dim}, init_zero={init_zero}, slot={self._ple_slot_index}"
+                    f"per_layer_dim={per_layer_dim}, init_zero={init_zero}, "
+                    f"slot={self._ple_slot_index}, injection={injection}"
                 )
 
     def build_schedule_node(self):
@@ -871,6 +874,10 @@ class TransformerLayer(nn.Layer):
                         block_attention_residuals=True,
                     )
 
+            # PLE post_attn injection for block_attention_residuals path
+            if self._ple_active and self._ple_inject_post_attn and per_layer_input is not None:
+                hidden_states = self.per_layer_gate(hidden_states, per_layer_input)
+
             # Accumulate attn output into partial_block
             if (
                 partial_block is not None
@@ -919,12 +926,15 @@ class TransformerLayer(nn.Layer):
             self._log_md5(
                 hidden_states, "post_attn_residual", self.layer_number
             )
+            # ============ PLE post_attn injection (方案1) ============
+            if self._ple_active and self._ple_inject_post_attn and per_layer_input is not None:
+                hidden_states = self.per_layer_gate(hidden_states, per_layer_input)
             with profile(timer_name):
                 output = self._forward_mlp(hidden_states, input_ids=input_ids)
             self._log_md5(output, "layer_output", self.layer_number)
 
-        # ============ Apply PLE gating inside recompute boundary ============
-        if self.use_per_layer_embeddings and self._ple_active and per_layer_input is not None:
+        # ============ PLE post_mlp injection (原始位置) ============
+        if self._ple_active and not self._ple_inject_post_attn and per_layer_input is not None:
             output = self.per_layer_gate(output, per_layer_input)
 
         if context is not None:
