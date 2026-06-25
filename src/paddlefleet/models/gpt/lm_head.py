@@ -162,11 +162,6 @@ class GPTLMHead(ColumnParallelLinear):
     def forward(self, dict_args: dict):
         hidden_states = dict_args["hidden_states"]
 
-        # Apply final Block Attention Residual if enabled
-        if self.config.block_attention_residuals:
-            blocks = dict_args.get("blocks", [])
-            hidden_states = self.block_attn_res(hidden_states, blocks)
-
         if (
             self.config.num_nextn_predict_layers is not None
             and self.config.num_nextn_predict_layers > 0
@@ -176,11 +171,18 @@ class GPTLMHead(ColumnParallelLinear):
                 hidden_states,
                 self.config.num_nextn_predict_layers + 1,
             )
-            logits = [self._forward(tensor_list[0])]
+            decoder_hs = tensor_list[0]
+            if self.config.block_attention_residuals:
+                blocks = dict_args.get("blocks", [])
+                decoder_hs = self.block_attn_res(decoder_hs, blocks)
+            logits = [self._forward(decoder_hs)]
             for i in range(self.config.num_nextn_predict_layers):
                 logits.append(self._forward(tensor_list[i + 1]))
             return logits
         else:
+            if self.config.block_attention_residuals:
+                blocks = dict_args.get("blocks", [])
+                hidden_states = self.block_attn_res(hidden_states, blocks)
             return self._forward(hidden_states)
 
     @property
@@ -215,22 +217,21 @@ class GPTMainLMHead(GPTLMHead):
     def forward(self, dict_args: dict):
         hidden_states = dict_args["hidden_states"]
         mtp_loss = dict_args.get("mtp_loss", None)
-        if self.config.block_attention_residuals:
-            blocks = dict_args.get("blocks", [])
-            hidden_states = self.block_attn_res(hidden_states, blocks)
 
         tensor_list = paddle.split(
             hidden_states,
             self.config.num_nextn_predict_layers + 1,
         )
-        logits = self._forward(tensor_list[0])
+        decoder_hs = tensor_list[0]
+        if self.config.block_attention_residuals:
+            blocks = dict_args.get("blocks", [])
+            decoder_hs = self.block_attn_res(decoder_hs, blocks)
+
+        logits = self._forward(decoder_hs)
         ret = {
             "logits": logits,
             "mtp_loss": mtp_loss,
         }
-        # Filter out None values to avoid AttributeError in
-        # convert_tensor_dict_to_tuple when pipeline stage boundary
-        # separates GPTMainLMHead from MTPLanguageLoss
         for key in list(ret.keys()):
             if ret[key] is None:
                 ret.pop(key)
